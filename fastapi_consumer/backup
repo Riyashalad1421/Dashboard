@@ -1,0 +1,236 @@
+import asyncio
+import json
+import hashlib
+from collections import defaultdict
+import aiokafka
+import redis.asyncio as redis
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+
+# Enable CORS for frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Redis connection
+redis_client = redis.Redis(host="redis", port=6379, decode_responses=True)
+
+TOPICS = [
+    "taxi_speed_events",
+    "taxi_avg_speed_updates",
+    "taxi_distance_updates",
+    "taxi_violation_alerts",
+    "taxi_location_snapshots",
+    "taxi_fleet_summary",
+    "taxi_registry_updates"
+]
+
+KAFKA_BOOTSTRAP_SERVERS = "kafka:9092"
+GROUP_ID = "fastapi-kafka-consumer"
+taxi_update_counter = defaultdict(int)
+
+async def consume():
+    consumer = aiokafka.AIOKafkaConsumer(
+        *TOPICS,
+        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+        group_id=GROUP_ID,
+        value_deserializer=lambda m: json.loads(m.decode("utf-8")),
+        auto_offset_reset='earliest'
+    )
+
+    while True:
+        try:
+            await consumer.start()
+            print("✅ Kafka consumer started")
+            break
+        except aiokafka.errors.KafkaConnectionError as e:
+            print(f"🔁 Kafka not ready: {e}. Retrying in 3 seconds...")
+            await asyncio.sleep(3)
+
+    try:
+        async for msg in consumer:
+            print(f"✅ Received from {msg.topic}: {msg.value}")
+            await process_message(msg.topic, msg.value)
+    finally:
+        await consumer.stop()
+
+async def process_message(topic, data):
+    if topic == "taxi_speed_events":
+        await redis_client.set(f"latest_speed:{data['taxi_id']}", json.dumps(data))
+
+    elif topic == "taxi_avg_speed_updates":
+        await redis_client.hset("avg_speed", data['taxi_id'], data["avg_speed"])
+
+    elif topic == "taxi_distance_updates":
+        await redis_client.hset("distance", data['taxi_id'], data["total_distance"])
+
+    elif topic == "taxi_violation_alerts":
+        key = f"alerts:{data['taxi_id']}"
+        await redis_client.lpush(key, json.dumps(data))
+        await redis_client.ltrim(key, 0, 9)
+
+    elif topic == "taxi_location_snapshots":
+        taxi_id = data["taxi_id"]
+        taxi_update_counter[taxi_id] += 1
+        if taxi_update_counter[taxi_id] % 3 != 0:
+            return
+        await redis_client.set(f"snapshot:{taxi_id}", json.dumps(data))
+        await redis_client.sadd("taxi_ids", taxi_id)
+
+    elif topic == "taxi_fleet_summary":
+        await redis_client.set(f"fleet_summary:{data['window_start']}", data["taxi_count"])
+
+    elif topic == "taxi_registry_updates":
+        await redis_client.sadd("taxi_ids", data["taxi_id"])
+
+@app.on_event("startup")
+async def startup_event():
+    for _ in range(10):
+        try:
+            await redis_client.ping()
+            break
+        except Exception:
+            print("🔁 Waiting for Redis...")
+            await asyncio.sleep(1)
+    asyncio.create_task(consume())
+    asyncio.create_task(clear_taxi_counters())
+
+async def clear_taxi_counters():
+    while True:
+        await asyncio.sleep(60)
+        taxi_update_counter.clear()
+        print("🧹 Cleared taxi_update_counter for memory efficiency.")
+
+@app.get("/")
+async def root():
+    return {"status": "Kafka consumer running"}
+
+@app.get("/speed/{taxi_id}")
+async def get_latest_speed(taxi_id: str):
+    value = await redis_client.get(f"latest_speed:{taxi_id}")
+    try:
+        return json.loads(value) if value else {}
+    except Exception as e:
+        print(f"❌ Failed to decode latest_speed for {taxi_id}: {e}")
+        return {}
+
+@app.get("/avg_speed/{taxi_id}")
+async def get_avg_speed(taxi_id: str):
+    value = await redis_client.hget("avg_speed", taxi_id)
+    return {"taxi_id": taxi_id, "avg_speed": value}
+
+@app.get("/distance/{taxi_id}")
+async def get_distance(taxi_id: str, speed: float = 1.0):
+    value = await redis_client.hget("distance", taxi_id)
+    if value is None:
+        return {"taxi_id": taxi_id, "total_distance": "0.0"}
+    try:
+        scaled_distance = float(value) * speed
+        return {"taxi_id": taxi_id, "total_distance": f"{scaled_distance:.6f}"}
+    except ValueError:
+        return {"taxi_id": taxi_id, "total_distance": "0.0"}
+
+@app.get("/alerts/{taxi_id}")
+async def get_alerts(taxi_id: str, speed: float = 1.0):
+    max_len = min(int(10 * speed), 100)
+    alerts = await redis_client.lrange(f"alerts:{taxi_id}", 0, max_len - 1)
+    return {"taxi_id": taxi_id, "alerts": [json.loads(a) for a in alerts]}
+
+@app.get("/snapshot/{taxi_id}")
+async def get_snapshot(taxi_id: str):
+    snapshot = await redis_client.get(f"snapshot:{taxi_id}")
+    try:
+        return json.loads(snapshot) if snapshot else {}
+    except Exception as e:
+        print(f"❌ Error decoding snapshot for {taxi_id}: {e}")
+        return {}
+
+@app.get("/fleet_summary/{window_start}")
+async def get_fleet_summary(window_start: str, speed: float = 1.0):
+    value = await redis_client.get(f"fleet_summary:{window_start}")
+    try:
+        scaled = int(int(value) * speed) if value else 0
+        return {"window_start": window_start, "taxi_count": scaled}
+    except:
+        return {"window_start": window_start, "taxi_count": 0}
+
+@app.get("/fleet-summary")
+async def get_fleet_summary_latest():
+    keys = await redis_client.keys("fleet_summary:*")
+    if not keys:
+        return {
+            "total_taxis": 0,
+            "active_taxis": 0,
+            "total_distance_km": 0.0,
+            "avg_speed_kmh": 0.0
+        }
+    latest_key = sorted(keys)[-1]
+    count = await redis_client.get(latest_key)
+    try:
+        return {
+            "total_taxis": int(count),
+            "active_taxis": int(count),
+            "total_distance_km": 0.0,
+            "avg_speed_kmh": 0.0
+        }
+    except:
+        return {
+            "total_taxis": 0,
+            "active_taxis": 0,
+            "total_distance_km": 0.0,
+            "avg_speed_kmh": 0.0
+        }
+
+@app.get("/taxi_ids")
+async def get_taxi_ids():
+    ids = await redis_client.smembers("taxi_ids")
+    return {"taxi_ids": sorted(ids)}
+
+@app.get("/snapshots")
+async def get_all_snapshots():
+    taxi_ids = await redis_client.smembers("taxi_ids")
+    keys = [f"snapshot:{taxi_id}" for taxi_id in taxi_ids]
+    snapshots = await redis_client.mget(*keys)
+    results = []
+    for snap in snapshots:
+        if snap:
+            try:
+                results.append(json.loads(snap))
+            except json.JSONDecodeError:
+                continue
+    return results
+
+@app.websocket("/ws/taxi")
+async def stream_taxi_snapshots(websocket: WebSocket):
+    await websocket.accept()
+    print("🚦 WebSocket connection accepted")
+    last_hash = None
+    try:
+        while True:
+            taxi_ids = await redis_client.smembers("taxi_ids")
+            keys = [f"snapshot:{taxi_id}" for taxi_id in taxi_ids]
+            snapshots = await redis_client.mget(*keys)
+            result = []
+            for snap in snapshots:
+                if snap:
+                    try:
+                        result.append(json.loads(snap))
+                    except json.JSONDecodeError:
+                        continue
+            serialized = json.dumps(result, separators=(",", ":"))
+            current_hash = hashlib.md5(serialized.encode()).hexdigest()
+            if current_hash != last_hash:
+                await websocket.send_text(serialized)
+                last_hash = current_hash
+                print(f"📤 Sent {len(result)} taxis @ {len(serialized)} bytes")
+            await asyncio.sleep(15)
+    except WebSocketDisconnect:
+        print("🔌 WebSocket client disconnected")
+    except Exception as e:
+        print(f"❌ WebSocket error: {e}")
